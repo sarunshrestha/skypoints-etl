@@ -28,6 +28,7 @@ CREATE FILE FORMAT IF NOT EXISTS FF_MEMBER_PIPE
     FIELD_OPTIONALLY_ENCLOSED_BY  = NONE
     TRIM_SPACE                    = TRUE
     EMPTY_FIELD_AS_NULL           = TRUE
+    NULL_IF                       = ('NULL', 'null', 'N/A', 'NA', 'NONE')   -- literal null sentinels (AUS sends "NULL")
     ERROR_ON_COLUMN_COUNT_MISMATCH = FALSE     -- short/long rows are caught by DQ, not by COPY
     ENCODING                      = 'UTF8';
 

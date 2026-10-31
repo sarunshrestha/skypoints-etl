@@ -111,7 +111,7 @@ SELECT
             'INVALID_DATE:dob=' || w.raw_dob, NULL),
         IFF(LENGTH(w.member_id)   > 18,  'LENGTH_EXCEEDED:member_id',   NULL),
         IFF(LENGTH(w.member_name) > 255, 'LENGTH_EXCEEDED:member_name', NULL),
-        IFF(w.member_id IS NOT NULL AND NOT REGEXP_LIKE(w.member_id, '^[0-9]+$'),
+        IFF(w.member_id IS NOT NULL AND NOT REGEXP_LIKE(w.member_id, '^[A-Za-z0-9-]+$'),
             'INVALID_FORMAT:member_id', NULL),
         -- we cannot route a member to a country table we cannot identify
         IFF(w.country_code IS NULL,
@@ -130,7 +130,7 @@ SELECT
         IFF(w.enrollment_date  > $AS_OF_DATE,      'ENROLLMENT_DATE_IN_FUTURE', NULL),
         IFF(w.age NOT BETWEEN 0 AND 120,           'AGE_OUT_OF_RANGE:' || w.age, NULL),
         IFF(LENGTH(w.raw_dob) = 7,                 'DOB_LEADING_ZERO_RESTORED', NULL),
-        IFF(LENGTH(w.member_id) < 6,               'MEMBER_ID_SHORTER_THAN_EXPECTED', NULL),
+        IFF(REGEXP_LIKE(w.member_id, '^[0-9]+$') AND LENGTH(w.member_id) < 6, 'MEMBER_ID_SHORTER_THAN_EXPECTED', NULL),
         IFF(LENGTH(w.state) > 5,                   'LENGTH_EXCEEDED:state', NULL)
     )) AS dq_warnings
 FROM WRK_MEMBER_TYPED w;

@@ -81,7 +81,7 @@ FROM  (SELECT n FROM daily WHERE d = CURRENT_DATE()) t,
 --   MANDATORY_MISSING     member_name, member_id, enrollment_date  (spec: Mandatory = Y)
 --   INVALID_DATE          enrollment_date / last_flight_date (YYYYMMDD), dob (MMDDYYYY)
 --   LENGTH_EXCEEDED       member_id > 18, member_name > 255
---   INVALID_FORMAT        member_id not numeric
+--   INVALID_FORMAT        member_id has characters outside [A-Za-z0-9-]
 --   UNKNOWN_COUNTRY       country not in REF_COUNTRY_ALIAS -> cannot be routed
 --  WARNING (row loads, flag in DQ_WARNINGS)
 --   COUNTRY_CODE_NORMALISED   PHIL->PHL, AU->AUS     (seen in sample)
