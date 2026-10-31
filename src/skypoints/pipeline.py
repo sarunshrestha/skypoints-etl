@@ -14,6 +14,7 @@ from datetime import date, datetime
 from pathlib import Path
 
 from . import legacy
+from .checks import run_batch_checks
 from .filename import FileNameError, parse_file_name
 from .parser import read_member_file
 from .redemptions import Redemption, RedemptionReject, dedupe_latest, flatten, load_documents
@@ -40,6 +41,7 @@ class RunReport:
     moves: list[dict] = field(default_factory=list)
     redemptions: dict = field(default_factory=dict)
     invariants: dict[str, bool] = field(default_factory=dict)
+    batch_checks: list[dict] = field(default_factory=list)
 
 
 def _reason_key(reason: str) -> str:
@@ -125,6 +127,8 @@ def run(input_dir: Path | None, legacy_dir: Path | None, out_dir: Path, as_of: d
         "xref_in_sync": set(tables.xref) == set(ids) and all(
             tables.xref[m].target_table == members[m].target_table for m in ids),
     }
+
+    report.batch_checks = [asdict(c) for c in run_batch_checks(all_staged) if not c.passed]
 
     _write_outputs(out_dir, tables, all_rejects, facts, members, redemption_rejects, report)
     return report
