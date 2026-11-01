@@ -15,6 +15,12 @@ USE SCHEMA SKYPOINTS.STAGING;
 
 BEGIN TRANSACTION;
 
+-- consume the stream with DML so its offset advances on COMMIT
+CREATE OR REPLACE TEMPORARY TABLE WRK_RDM_DELTA LIKE SKYPOINTS.RAW.RAW_REDEMPTION_FEED;
+INSERT INTO WRK_RDM_DELTA (payload, src_file_name, src_file_ts, src_row_number, load_id, loaded_at)
+SELECT payload, src_file_name, src_file_ts, src_row_number, load_id, loaded_at
+FROM   SKYPOINTS.RAW.STRM_RAW_REDEMPTION_FEED;
+
 CREATE OR REPLACE TEMPORARY TABLE WRK_REDEMPTION_FLAT AS
 SELECT
     f.payload:member_id::VARCHAR                                 AS member_id,
@@ -28,7 +34,7 @@ SELECT
     r.value:txn_date::VARCHAR                                    AS raw_txn_date,
     r.value:miles_redeemed::VARCHAR                              AS raw_miles,
     f.src_file_name, f.src_file_ts, f.load_id
-FROM SKYPOINTS.RAW.STRM_RAW_REDEMPTION_FEED f,
+FROM WRK_RDM_DELTA f,
      LATERAL FLATTEN(INPUT => f.payload:redemptions, OUTER => TRUE) r;
      -- OUTER => TRUE keeps documents with an empty/missing array so we can
      -- report them, instead of silently dropping them.

@@ -14,7 +14,7 @@ with **Age** and **Stale_Member**, and split into **one table per country** with
 | Data validation | `sql/07_validations.sql` + row rules in 04 | `staging.py`, `checks.py` |
 
 The SQL is the production design. The Python package implements the **same rules** so
-they can be unit-tested and demoed on a laptop without a warehouse (65 tests), and a
+they can be unit-tested and demoed on a laptop without a warehouse (66 tests), and a
 test transpiles the key Snowflake expressions to DuckDB to make sure SQL and Python agree.
 
 ---
@@ -23,7 +23,7 @@ test transpiles the key Snowflake expressions to DuckDB to make sure SQL and Pyt
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest -q                                   # 65 tests
+python -m pytest -q                                   # 66 tests
 
 PYTHONPATH=src python -m skypoints.pipeline \
     --input  data/sample  \

@@ -41,12 +41,18 @@ BEGIN
 
     BEGIN TRANSACTION;
 
+    -- consume the stream with DML so its offset advances on COMMIT
+    CREATE OR REPLACE TEMPORARY TABLE WRK_STG_DELTA LIKE SKYPOINTS.STAGING.STG_MEMBER_PROFILE;
+    INSERT INTO WRK_STG_DELTA
+        SELECT * EXCLUDE (METADATA$ACTION, METADATA$ISUPDATE, METADATA$ROW_ID)
+        FROM SKYPOINTS.STAGING.STRM_STG_MEMBER_PROFILE;
+
     -- 1 + 2 : latest record per member, newer than what is already applied
     CREATE OR REPLACE TEMPORARY TABLE WRK_LATEST AS
     SELECT s.*, r.target_table,
            x.country_code AS prev_country_code,
            x.target_table AS prev_target_table
-    FROM   SKYPOINTS.STAGING.STRM_STG_MEMBER_PROFILE s
+    FROM   WRK_STG_DELTA s
     JOIN   (SELECT DISTINCT country_code, target_table FROM SKYPOINTS.STAGING.REF_COUNTRY_ALIAS) r
            ON r.country_code = s.country_code
     LEFT JOIN MEMBER_COUNTRY_XREF x

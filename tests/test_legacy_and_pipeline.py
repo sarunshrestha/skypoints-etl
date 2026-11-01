@@ -65,3 +65,16 @@ def test_spec_key_problem_is_detected(tmp_path):
     names = {c["name"]: c for c in report.batch_checks}
     assert "MIKE" in names["SPEC_KEY_MEMBER_NAME_NOT_UNIQUE"]["details"]
     assert names["SUSPICIOUS_CONSTANT_COLUMN"]["failed"] >= 3
+
+
+def test_day_two_move_reject_and_orphan(tmp_path):
+    report = run([SAMPLE, SAMPLE.parent / "demo_day2"], LEGACY, tmp_path, date(2024, 1, 16))
+    assert [(m["member_id"], m["from_country"], m["to_country"]) for m in report.moves] == [("223458", "IND", "CAN")]
+    with (tmp_path / "TABLE_INDIA.csv").open() as fh:
+        assert "223458" not in {r["member_id"] for r in csv.DictReader(fh)}
+    assert report.reject_reasons == {"INVALID_DATE": 2, "MANDATORY_MISSING": 1, "UNKNOWN_COUNTRY": 1}
+    assert report.redemptions == {"transactions": 3, "rejected": 1, "orphans": 1}
+    with (tmp_path / "REDEMPTION_ENRICHED.csv").open() as fh:
+        status = {r["txn_id"]: r["status"] for r in csv.DictReader(fh)}
+    assert status["RX10092"] == "COMPLETED"
+    assert all(report.invariants.values())

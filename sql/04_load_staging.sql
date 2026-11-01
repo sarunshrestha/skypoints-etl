@@ -21,12 +21,22 @@ SET AS_OF_DATE = CURRENT_DATE();
 BEGIN TRANSACTION;
 
 -- ---------------------------------------------------------------------
--- 1) Materialise the delta (this consumes the stream on COMMIT)
+-- 1) Materialise the delta. A stream's offset only advances when it is
+--    read by a DML statement (INSERT/MERGE) that commits, so copy it
+--    with INSERT ... SELECT rather than CTAS.
 -- ---------------------------------------------------------------------
+CREATE OR REPLACE TEMPORARY TABLE WRK_RAW_DELTA LIKE SKYPOINTS.RAW.RAW_MEMBER_PROFILE;
+
+INSERT INTO WRK_RAW_DELTA
+SELECT record_type, member_name, member_id, enrollment_date, last_flight_date, tier_code,
+       agent_name, state, country, post_code, dob, is_active,
+       src_file_name, src_file_ts, src_row_number, raw_line, load_id, loaded_at
+FROM   SKYPOINTS.RAW.STRM_RAW_MEMBER_PROFILE;
+
 CREATE OR REPLACE TEMPORARY TABLE WRK_MEMBER_TYPED AS
 WITH src AS (
     SELECT *
-    FROM   SKYPOINTS.RAW.STRM_RAW_MEMBER_PROFILE
+    FROM   WRK_RAW_DELTA
     WHERE  record_type = 'D'                              -- drop header / trailer lines
 ),
 typed AS (
