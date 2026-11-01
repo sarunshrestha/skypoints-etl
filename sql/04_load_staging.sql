@@ -1,30 +1,14 @@
--- =====================================================================
--- 04_load_staging.sql  —  RAW -> STAGING with AGE and STALE_MEMBER
--- (brief deliverable #2)
--- ---------------------------------------------------------------------
--- Runs as a Snowflake TASK every N minutes. Reads ONLY new rows from the
--- stream, so cost scales with the day's delta, not table size.
---
---   1. Type every field with TRY_* functions (never fail the batch).
---   2. Normalise country codes through REF_COUNTRY_ALIAS.
---   3. Compute AGE and STALE_MEMBER as of :AS_OF_DATE.
---   4. Collect blocking reasons -> AUDIT.MEMBER_REJECTS
---      everything else          -> STAGING.STG_MEMBER_PROFILE
--- =====================================================================
+-- 04_load_staging.sql: RAW -> STAGING
+-- Types fields, normalises country, computes AGE / STALE_MEMBER,
+-- writes rejects or STG_MEMBER_PROFILE.
 
 USE SCHEMA SKYPOINTS.STAGING;
 
--- Pin the "as of" date once per run so every row in a batch is computed
--- against the same day (and re-runs for a past date are reproducible).
 SET AS_OF_DATE = CURRENT_DATE();
 
 BEGIN TRANSACTION;
 
--- ---------------------------------------------------------------------
--- 1) Materialise the delta. A stream's offset only advances when it is
---    read by a DML statement (INSERT/MERGE) that commits, so copy it
---    with INSERT ... SELECT rather than CTAS.
--- ---------------------------------------------------------------------
+-- Stream offset advances only on DML commit.
 CREATE OR REPLACE TEMPORARY TABLE WRK_RAW_DELTA LIKE SKYPOINTS.RAW.RAW_MEMBER_PROFILE;
 
 INSERT INTO WRK_RAW_DELTA
@@ -37,7 +21,7 @@ CREATE OR REPLACE TEMPORARY TABLE WRK_MEMBER_TYPED AS
 WITH src AS (
     SELECT *
     FROM   WRK_RAW_DELTA
-    WHERE  record_type = 'D'                              -- drop header / trailer lines
+    WHERE  record_type = 'D'
 ),
 typed AS (
     SELECT
@@ -50,14 +34,9 @@ typed AS (
         UPPER(NULLIF(TRIM(state), ''))                               AS state,
         UPPER(NULLIF(TRIM(country), ''))                             AS country_code_raw,
         NULLIF(TRIM(post_code), '')                                  AS post_code,
-        -- DOB arrives as MMDDYYYY (different from the other dates!).
-        -- If something upstream cast it to a number the leading zero is
-        -- lost (03051985 -> 3051985, as seen in the brief's staging
-        -- table). LPAD restores it; a 7-digit value is only ever a
-        -- single-digit month, so this is unambiguous.
+        -- DOB is MMDDYYYY; LPAD covers leading-zero loss (3051985 -> 03051985)
         TRY_TO_DATE(LPAD(TRIM(dob), 8, '0'), 'MMDDYYYY')             AS dob,
         UPPER(NULLIF(TRIM(is_active), ''))                           AS is_active,
-        -- keep raw strings so reasons can quote the bad value
         enrollment_date  AS raw_enrollment_date,
         last_flight_date AS raw_last_flight_date,
         dob              AS raw_dob,
@@ -75,16 +54,10 @@ SELECT
     r.country_code,
     r.target_table,
     (rt.tier_code IS NOT NULL)                                       AS tier_is_known,
-    -- ---------- derived columns (deliverable #2) ----------
-    -- Age in completed years: subtract one if this year's birthday is
-    -- still ahead of AS_OF_DATE. (DATEDIFF('year') alone counts calendar
-    -- boundaries and would make someone born on 31-Dec one year old on 1-Jan.)
     IFF(t.dob IS NULL, NULL,
         DATEDIFF('year', t.dob, $AS_OF_DATE)
         - IFF(DATEADD('year', DATEDIFF('year', t.dob, $AS_OF_DATE), t.dob) > $AS_OF_DATE, 1, 0)
     )                                                                AS age,
-    -- A member who has never flown is measured from enrollment: a member
-    -- who joined 2 years ago and never flew is clearly stale.
     DATEDIFF('day', COALESCE(t.last_flight_date, t.enrollment_date), $AS_OF_DATE)
                                                                      AS days_since_flight,
     days_since_flight > 90                                           AS stale_member,
@@ -101,11 +74,7 @@ LEFT JOIN REF_COUNTRY_ALIAS r
 LEFT JOIN REF_TIER rt
        ON rt.tier_code = t.tier_code;
 
--- ---------------------------------------------------------------------
--- 2) Evaluate row-level rules (detail in 07_validations.sql)
---    BLOCKING  -> row rejected
---    WARNING   -> row kept, warning stored in DQ_WARNINGS
--- ---------------------------------------------------------------------
+-- BLOCKING -> reject; WARNING -> keep with dq_warnings
 CREATE OR REPLACE TEMPORARY TABLE WRK_MEMBER_CHECKED AS
 SELECT
     w.*,
@@ -123,7 +92,6 @@ SELECT
         IFF(LENGTH(w.member_name) > 255, 'LENGTH_EXCEEDED:member_name', NULL),
         IFF(w.member_id IS NOT NULL AND NOT REGEXP_LIKE(w.member_id, '^[A-Za-z0-9-]+$'),
             'INVALID_FORMAT:member_id', NULL),
-        -- we cannot route a member to a country table we cannot identify
         IFF(w.country_code IS NULL,
             'UNKNOWN_COUNTRY:' || COALESCE(w.country_code_raw, '<null>'), NULL)
     )) AS reject_reasons,
@@ -145,9 +113,6 @@ SELECT
     )) AS dq_warnings
 FROM WRK_MEMBER_TYPED w;
 
--- ---------------------------------------------------------------------
--- 3) Route
--- ---------------------------------------------------------------------
 INSERT INTO SKYPOINTS.AUDIT.MEMBER_REJECTS
        (src_file_name, src_row_number, member_id, reject_reasons, raw_record, load_id)
 SELECT  src_file_name, src_row_number, member_id, reject_reasons, raw_record, load_id
@@ -168,12 +133,3 @@ FROM WRK_MEMBER_CHECKED
 WHERE ARRAY_SIZE(reject_reasons) = 0;
 
 COMMIT;
-
--- ---------------------------------------------------------------------
--- NOTE on AGE / STALE_MEMBER being time-dependent
--- These values are correct on AS_OF_DATE and drift every day. Staging
--- stores them (as the brief asks) together with AS_OF_DATE so nobody
--- mistakes them for timeless facts. For consumers we ALSO expose them as
--- computed-at-read columns in CORE.V_MEMBER_CURRENT (05_split_countries.sql),
--- so dashboards never read a stale "stale flag".
--- ---------------------------------------------------------------------

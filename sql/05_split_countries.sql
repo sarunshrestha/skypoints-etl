@@ -1,24 +1,7 @@
--- =====================================================================
--- 05_split_countries.sql  —  STAGING -> TABLE_<COUNTRY>
--- (brief deliverable #3: per-country split with "latest record wins")
--- ---------------------------------------------------------------------
--- Definition of "latest":
---   ORDER BY src_file_ts DESC, src_row_number DESC
---   i.e. the most recently *produced* file wins, and inside one file the
---   later line wins. We deliberately do NOT use last_flight_date: it is
---   optional, describes travel not data currency, and a member who moves
---   country without flying would never be moved.
---
--- Algorithm per run (incremental, driven by a stream on staging):
---   1. Collapse the batch to 1 row per member (latest wins inside batch).
---   2. Compare to MEMBER_COUNTRY_XREF and drop anything OLDER than what
---      is already applied  -> safe against late / replayed files.
---   3. Members whose country changed: DELETE from the old country table,
---      log the move.
---   4. MERGE into the new country table (insert or update if hash changed).
---   5. Upsert MEMBER_COUNTRY_XREF.
--- All of it in ONE transaction so a member is never in 0 or 2 tables.
--- =====================================================================
+-- 05_split_countries.sql: STAGING -> TABLE_<COUNTRY>
+-- Latest = ORDER BY src_file_ts DESC, src_row_number DESC (not flight date).
+-- Per run: dedupe batch, skip older than xref, delete movers from old table,
+-- MERGE into new table, upsert xref. One transaction.
 
 USE SCHEMA SKYPOINTS.CORE;
 
@@ -63,7 +46,7 @@ BEGIN
     QUALIFY ROW_NUMBER() OVER (PARTITION BY s.member_id
                                ORDER BY s.src_file_ts DESC, s.src_row_number DESC) = 1;
 
-    -- 3 : movers — remove from the table they used to live in
+    -- 3 : movers: remove from previous country table
     INSERT INTO MEMBER_COUNTRY_MOVES (member_id, from_country_code, to_country_code, moved_on_file_ts)
     SELECT member_id, prev_country_code, country_code, src_file_ts
     FROM   WRK_LATEST
@@ -120,9 +103,6 @@ EXCEPTION
 END;
 $$;
 
--- ---------------------------------------------------------------------
--- Orchestration: chain the tasks so split runs right after staging load.
--- ---------------------------------------------------------------------
 CREATE OR REPLACE TASK SKYPOINTS.STAGING.TSK_LOAD_STAGING
     WAREHOUSE = WH_SKYPOINTS_ETL
     SCHEDULE  = '15 MINUTE'
@@ -137,11 +117,7 @@ CREATE OR REPLACE TASK SKYPOINTS.CORE.TSK_SPLIT_COUNTRIES
 AS
     CALL SKYPOINTS.CORE.SP_SPLIT_MEMBERS_BY_COUNTRY();
 
--- ---------------------------------------------------------------------
--- Consumer view: one logical "all members" table with AGE / STALE
--- recomputed at read time (they are time-dependent; see 04 notes).
--- Regenerate when a new country table is created.
--- ---------------------------------------------------------------------
+-- AGE / STALE recomputed at read (values drift daily)
 CREATE OR REPLACE VIEW V_MEMBER_CURRENT AS
 WITH all_members AS (
     SELECT * FROM TABLE_USA         UNION ALL

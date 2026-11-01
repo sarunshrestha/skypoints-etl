@@ -1,15 +1,7 @@
--- =====================================================================
--- 03_ddl_targets.sql  —  CORE layer: per-country target tables (Snowflake)
--- ---------------------------------------------------------------------
--- The brief asks for Table_India, Table_USA, ... .  All country tables
--- share ONE template so their structure can never drift; new countries
--- are created automatically by SP_ENSURE_COUNTRY_TABLES the first time a
--- new code appears in staging (no manual DDL per country).
---
--- Alongside them, MEMBER_COUNTRY_XREF records which country table each
--- member currently lives in. That is what makes "member moved countries"
--- cheap: we look up one row instead of scanning every country table.
--- =====================================================================
+-- 03_ddl_targets.sql: CORE per-country targets (Snowflake)
+-- All TABLE_<COUNTRY> share TEMPLATE_COUNTRY_MEMBER.
+-- SP_ENSURE_COUNTRY_TABLES creates new ones on demand.
+-- MEMBER_COUNTRY_XREF tracks which table each member is in.
 
 USE SCHEMA SKYPOINTS.CORE;
 
@@ -33,37 +25,26 @@ CREATE TABLE IF NOT EXISTS TEMPLATE_COUNTRY_MEMBER (
     src_file_ts          TIMESTAMP_NTZ NOT NULL,
     created_at           TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP(),
     updated_at           TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP(),
-    CONSTRAINT pk_member PRIMARY KEY (member_id)       -- informational in Snowflake; enforced by MERGE + DQ check
+    CONSTRAINT pk_member PRIMARY KEY (member_id)
 )
-COMMENT = 'Structure template for every TABLE_<COUNTRY>. Never loaded directly.';
+COMMENT = 'Template for TABLE_<COUNTRY>. Not loaded directly.';
 
--- The five countries in the sample (others are created on demand) --------
 CREATE TABLE IF NOT EXISTS TABLE_USA          LIKE TEMPLATE_COUNTRY_MEMBER;
 CREATE TABLE IF NOT EXISTS TABLE_INDIA        LIKE TEMPLATE_COUNTRY_MEMBER;
 CREATE TABLE IF NOT EXISTS TABLE_PHILIPPINES  LIKE TEMPLATE_COUNTRY_MEMBER;
 CREATE TABLE IF NOT EXISTS TABLE_CANADA       LIKE TEMPLATE_COUNTRY_MEMBER;
 CREATE TABLE IF NOT EXISTS TABLE_AUSTRALIA    LIKE TEMPLATE_COUNTRY_MEMBER;
 
--- For lookups by member_id on billion-row tables, search optimisation
--- turns point lookups/MERGE probes into micro-partition pruning.
-ALTER TABLE TABLE_USA         ADD SEARCH OPTIMIZATION ON EQUALITY(member_id);
-ALTER TABLE TABLE_INDIA       ADD SEARCH OPTIMIZATION ON EQUALITY(member_id);
-ALTER TABLE TABLE_PHILIPPINES ADD SEARCH OPTIMIZATION ON EQUALITY(member_id);
-ALTER TABLE TABLE_CANADA      ADD SEARCH OPTIMIZATION ON EQUALITY(member_id);
-ALTER TABLE TABLE_AUSTRALIA   ADD SEARCH OPTIMIZATION ON EQUALITY(member_id);
-
--- Where is each member *now*? -------------------------------------------
 CREATE TABLE IF NOT EXISTS MEMBER_COUNTRY_XREF (
     member_id        VARCHAR(18)   NOT NULL PRIMARY KEY,
     country_code     VARCHAR(3)    NOT NULL,
     target_table     VARCHAR(100)  NOT NULL,
-    src_file_ts      TIMESTAMP_NTZ NOT NULL,     -- timestamp of the record that placed them here
+    src_file_ts      TIMESTAMP_NTZ NOT NULL,
     src_row_number   NUMBER        NOT NULL,
     updated_at       TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP()
 )
 CLUSTER BY (member_id);
 
--- History of country moves (useful for lounge-access audits & analytics)
 CREATE TABLE IF NOT EXISTS MEMBER_COUNTRY_MOVES (
     member_id          VARCHAR(18)   NOT NULL,
     from_country_code  VARCHAR(3),
@@ -72,7 +53,6 @@ CREATE TABLE IF NOT EXISTS MEMBER_COUNTRY_MOVES (
     recorded_at        TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP()
 );
 
--- Final redemption fact table (deduplicated on txn_id) -------------------
 CREATE TABLE IF NOT EXISTS FACT_REDEMPTION (
     txn_id           VARCHAR(32)   NOT NULL PRIMARY KEY,
     member_id        VARCHAR(18)   NOT NULL,
@@ -86,9 +66,6 @@ CREATE TABLE IF NOT EXISTS FACT_REDEMPTION (
 )
 CLUSTER BY (txn_date, member_id);
 
--- ---------------------------------------------------------------------
--- Create a country table the first time we see a new country.
--- ---------------------------------------------------------------------
 CREATE OR REPLACE PROCEDURE SP_ENSURE_COUNTRY_TABLES()
 RETURNS VARCHAR
 LANGUAGE SQL
