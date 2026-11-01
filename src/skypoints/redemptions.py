@@ -1,5 +1,4 @@
-"""JSON redemption feed -> flat transactions (mirrors sql/06_redemptions.sql)."""
-from __future__ import annotations
+"""Flatten partner redemption JSON."""
 
 import json
 from dataclasses import dataclass, field
@@ -7,7 +6,7 @@ from datetime import date
 from pathlib import Path
 from typing import Any, Iterable
 
-from .dates import parse_yyyymmdd
+from .staging import parse_yyyymmdd
 
 KNOWN_STATUSES = {"COMPLETED", "PENDING", "CANCELLED", "REVERSED"}
 
@@ -34,7 +33,6 @@ class RedemptionReject:
 
 
 def load_documents(path: str | Path) -> list[dict]:
-    """Accept a single JSON object, a JSON array, or JSON Lines."""
     text = Path(path).read_text(encoding="utf-8").strip()
     if not text:
         return []
@@ -53,13 +51,12 @@ def _date(value, field_name, reasons):
         return None
 
 
-def flatten(docs: Iterable[dict], src_file_name: str) -> tuple[list[Redemption], list[RedemptionReject]]:
-    rows: list[Redemption] = []
-    rejects: list[RedemptionReject] = []
+def flatten(docs: Iterable[dict], src_file_name: str):
+    rows, rejects = [], []
     for doc in docs:
         member_id = doc.get("member_id")
         member_id = str(member_id).strip() if member_id is not None else None
-        doc_reasons: list[str] = []
+        doc_reasons = []
         feed_date = _date(doc.get("feed_date"), "feed_date", doc_reasons)
         txns = doc.get("redemptions")
         if not member_id:
@@ -71,8 +68,7 @@ def flatten(docs: Iterable[dict], src_file_name: str) -> tuple[list[Redemption],
             continue
 
         for txn in txns:
-            reasons: list[str] = []
-            warnings: list[str] = []
+            reasons, warnings = [], []
             txn_id = txn.get("txn_id")
             if not txn_id:
                 reasons.append("MANDATORY_MISSING:txn_id")
@@ -94,14 +90,15 @@ def flatten(docs: Iterable[dict], src_file_name: str) -> tuple[list[Redemption],
             if reasons:
                 rejects.append(RedemptionReject(src_file_name, member_id, reasons, txn))
                 continue
-            rows.append(Redemption(txn_id, member_id, feed_date, txn_date, txn.get("partner"),
-                                   miles, status, src_file_name, warnings))
+            rows.append(Redemption(
+                txn_id, member_id, feed_date, txn_date, txn.get("partner"),
+                miles, status, src_file_name, warnings,
+            ))
     return rows, rejects
 
 
 def dedupe_latest(rows: Iterable[Redemption]) -> dict[str, Redemption]:
-    """txn_id is the key; the most recent feed_date wins (PENDING -> COMPLETED)."""
-    out: dict[str, Redemption] = {}
+    out = {}
     for r in rows:
         cur = out.get(r.txn_id)
         if cur is None or (r.feed_date or date.min) >= (cur.feed_date or date.min):

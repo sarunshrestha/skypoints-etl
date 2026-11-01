@@ -1,22 +1,15 @@
-"""End-to-end local run: feeds in a folder -> per-country CSVs + DQ report.
-
-    python -m skypoints.pipeline --input data/sample --legacy data/legacy \
-        --out out --as-of 2024-01-15
-"""
-from __future__ import annotations
+"""Run feeds locally and write country CSVs + a small DQ report."""
 
 import argparse
 import csv
 import json
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime
 from pathlib import Path
 
 from . import legacy
-from .checks import run_batch_checks
-from .filename import FileNameError, parse_file_name
-from .parser import read_member_file
+from .parser import FileNameError, parse_file_name, read_member_file
 from .redemptions import Redemption, RedemptionReject, dedupe_latest, flatten, load_documents
 from .router import CountryTables
 from .staging import Reject, StagedMember, stage_records
@@ -48,6 +41,36 @@ def _reason_key(reason: str) -> str:
     return reason.split(":", 1)[0]
 
 
+def _batch_checks(rows: list[StagedMember]) -> list[dict]:
+    # a few cross-row checks that show up in the sample / legacy data
+    out = []
+    by_file_id = defaultdict(int)
+    names_for_id = defaultdict(set)
+    ids_for_name = defaultdict(set)
+    for r in rows:
+        by_file_id[(r.src_file_name, r.member_id)] += 1
+        names_for_id[r.member_id].add(r.member_name.upper())
+        ids_for_name[r.member_name.upper()].add(r.member_id)
+
+    dups = {f"{f}:{m}": n for (f, m), n in by_file_id.items() if n > 1}
+    if dups:
+        out.append({"name": "DUPLICATE_MEMBER_ID_IN_FILE", "severity": "WARNING",
+                    "failed": len(dups), "details": dups})
+
+    multi_name = {m: sorted(n) for m, n in names_for_id.items() if len(n) > 1}
+    if multi_name:
+        out.append({"name": "MEMBER_ID_WITH_MULTIPLE_NAMES", "severity": "WARNING",
+                    "failed": len(multi_name), "details": multi_name})
+
+    # spec says name is the key; legacy has two different Mikes
+    name_clash = {n: sorted(i) for n, i in ids_for_name.items() if len(i) > 1}
+    if name_clash:
+        out.append({"name": "SPEC_KEY_MEMBER_NAME_NOT_UNIQUE", "severity": "WARNING",
+                    "failed": len(name_clash), "details": name_clash})
+
+    return out
+
+
 def run(input_dir: Path | list[Path] | None, legacy_dir: Path | None, out_dir: Path, as_of: date,
         legacy_ts: datetime | None = None) -> RunReport:
     report = RunReport(as_of=as_of.isoformat())
@@ -57,7 +80,6 @@ def run(input_dir: Path | list[Path] | None, legacy_dir: Path | None, out_dir: P
     redemption_rows: list[Redemption] = []
     redemption_rejects: list[RedemptionReject] = []
 
-    # ---- legacy extracts first: they are older than any unified feed -------
     if legacy_dir:
         ts = legacy_ts or datetime(2022, 12, 31)
         for name, adapter in legacy.ADAPTERS.items():
@@ -72,8 +94,6 @@ def run(input_dir: Path | list[Path] | None, legacy_dir: Path | None, out_dir: P
                                  "staged": len(staged), "rejected": len(rejects)})
             report.apply.append({"file": name, **asdict(res)})
 
-    # ---- unified feeds, oldest first (order does not change the outcome,
-    #      the router is order-independent, but it keeps logs readable) ----
     feeds = []
     input_dirs = [input_dir] if isinstance(input_dir, Path) else list(input_dir or [])
     for d in input_dirs:
@@ -83,6 +103,7 @@ def run(input_dir: Path | list[Path] | None, legacy_dir: Path | None, out_dir: P
                     feeds.append(parse_file_name(p))
                 except FileNameError as exc:
                     report.files.append({"file": p.name, "kind": "UNRECOGNISED", "error": str(exc)})
+
     for feed in sorted(feeds, key=lambda f: f.produced_at):
         if feed.kind == "MBR":
             raws, summary = read_member_file(feed.path)
@@ -106,7 +127,6 @@ def run(input_dir: Path | list[Path] | None, legacy_dir: Path | None, out_dir: P
             report.files.append({"file": feed.path.name, "kind": "RDM",
                                  "transactions": len(rows), "rejected": len(rejects)})
 
-    # ---- report -----------------------------------------------------------
     report.staged, report.rejected = len(all_staged), len(all_rejects)
     report.warnings = dict(Counter(_reason_key(w) for m in all_staged for w in m.dq_warnings))
     report.reject_reasons = dict(Counter(_reason_key(r) for j in all_rejects for r in j.reasons))
@@ -119,7 +139,6 @@ def run(input_dir: Path | list[Path] | None, legacy_dir: Path | None, out_dir: P
     report.redemptions = {"transactions": len(facts), "rejected": len(redemption_rejects),
                           "orphans": len(orphans)}
 
-    # invariants (= table-level checks C4/C5/C6 in 07_validations.sql)
     ids = [mid for rows in tables.tables.values() for mid in rows]
     report.invariants = {
         "member_in_exactly_one_table": len(ids) == len(set(ids)),
@@ -128,8 +147,7 @@ def run(input_dir: Path | list[Path] | None, legacy_dir: Path | None, out_dir: P
         "xref_in_sync": set(tables.xref) == set(ids) and all(
             tables.xref[m].target_table == members[m].target_table for m in ids),
     }
-
-    report.batch_checks = [asdict(c) for c in run_batch_checks(all_staged) if not c.passed]
+    report.batch_checks = _batch_checks(all_staged)
 
     _write_outputs(out_dir, tables, all_rejects, facts, members, redemption_rejects, report)
     return report
@@ -180,13 +198,11 @@ def _write_outputs(out_dir, tables, rejects, facts, members, redemption_rejects,
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--input", type=Path, nargs="*", default=[],
-                    help="folder(s) with SKYPOINTS_MBR_*/SKYPOINTS_RDM_* files")
-    ap.add_argument("--legacy", type=Path, help="folder with INDin.csv / USAin.csv / AUS.xlsx")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--input", type=Path, nargs="*", default=[])
+    ap.add_argument("--legacy", type=Path)
     ap.add_argument("--out", type=Path, default=Path("out"))
-    ap.add_argument("--as-of", type=date.fromisoformat, default=date.today(),
-                    help="date AGE / STALE_MEMBER are computed for (default: today)")
+    ap.add_argument("--as-of", type=date.fromisoformat, default=date.today())
     args = ap.parse_args(argv)
     report = run(args.input, args.legacy, args.out, args.as_of)
     print(json.dumps(asdict(report), indent=2, default=str))

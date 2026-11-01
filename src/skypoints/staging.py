@@ -1,30 +1,59 @@
-"""RAW -> STAGING: typing, row-level validation, derived columns.
-
-Mirrors sql/04_load_staging.sql. Each raw record ends up either as a
-``StagedMember`` (possibly carrying soft warnings) or as a ``Reject`` with
-every blocking reason listed — not just the first one found, so a source
-team can fix a row in one round-trip.
-"""
-from __future__ import annotations
+"""Type / validate member rows, compute age + stale flag."""
 
 import hashlib
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime
 
-from . import countries, dates
 from .parser import RawRecord
 
 VALID_TIERS = {"SLV", "GLD", "PLT"}
-VALID_ACTIVE_FLAGS = {"A", "I"}
+VALID_ACTIVE = {"A", "I"}
 MANDATORY = ("member_name", "member_id", "enrollment_date")
-MAX_LENGTH = {
+MAX_LEN = {
     "member_name": 255, "member_id": 18, "tier_code": 5, "agent_name": 255,
     "state": 5, "country": 5, "post_code": 10, "is_active": 1,
 }
-EXPECTED_MIN_MEMBER_ID_LEN = 6
-NULL_SENTINELS = {"NULL", "N/A", "NA", "NONE", "NIL", "-"}
-_MEMBER_ID = re.compile(r"^[A-Za-z0-9-]+$")
+NULL_WORDS = {"NULL", "N/A", "NA", "NONE", "NIL", "-"}
+_ID_RE = re.compile(r"^[A-Za-z0-9-]+$")
+
+# sample mixes ISO codes with PHIL / AU etc.
+_COUNTRY = {
+    "USA": ("USA", "TABLE_USA"), "US": ("USA", "TABLE_USA"),
+    "IND": ("IND", "TABLE_INDIA"), "IN": ("IND", "TABLE_INDIA"),
+    "PHL": ("PHL", "TABLE_PHILIPPINES"), "PH": ("PHL", "TABLE_PHILIPPINES"),
+    "PHIL": ("PHL", "TABLE_PHILIPPINES"),
+    "CAN": ("CAN", "TABLE_CANADA"), "CA": ("CAN", "TABLE_CANADA"),
+    "AUS": ("AUS", "TABLE_AUSTRALIA"), "AU": ("AUS", "TABLE_AUSTRALIA"),
+}
+
+
+def parse_yyyymmdd(value):
+    if value is None or not str(value).strip():
+        return None
+    s = str(value).strip()
+    if len(s) != 8 or not s.isdigit():
+        raise ValueError(s)
+    return datetime.strptime(s, "%Y%m%d").date()
+
+
+def parse_mmddyyyy(value):
+    # DOB is MMDDYYYY; staging sample had 3051985 (lost leading 0)
+    if value is None or not str(value).strip():
+        return None
+    s = str(value).strip()
+    if not s.isdigit() or len(s) not in (7, 8):
+        raise ValueError(s)
+    return datetime.strptime(s.zfill(8), "%m%d%Y").date()
+
+
+def age_on(dob, as_of):
+    if dob is None:
+        return None
+    years = as_of.year - dob.year
+    if (as_of.month, as_of.day) < (dob.month, dob.day):
+        years -= 1
+    return years
 
 
 @dataclass
@@ -53,8 +82,7 @@ class StagedMember:
     dq_warnings: list[str] = field(default_factory=list)
 
     @property
-    def order_key(self) -> tuple[datetime, int]:
-        """Ordering for "latest record wins": file timestamp, then line number."""
+    def order_key(self):
         return (self.src_file_ts, self.src_row_number)
 
 
@@ -70,72 +98,60 @@ class Reject:
 def _hash(m: StagedMember) -> str:
     parts = [m.member_name, m.member_id, m.enrollment_date, m.last_flight_date, m.tier_code,
              m.agent_name, m.state, m.country_code, m.post_code, m.dob, m.is_active]
-    payload = "|".join("" if p is None else str(p) for p in parts)
-    return hashlib.sha256(payload.encode()).hexdigest()
-
-
-def _upper(v: str | None) -> str | None:
-    return v.strip().upper() if v and v.strip() else None
+    return hashlib.sha256("|".join("" if p is None else str(p) for p in parts).encode()).hexdigest()
 
 
 def stage_record(raw: RawRecord, src_file_ts: datetime, as_of: date) -> StagedMember | Reject:
-    reasons: list[str] = list(raw.issues)
-    warnings: list[str] = []
-
-    # Literal "NULL"/"N/A" strings are missing values, not data (AUS.xlsx
-    # sends DOB = "NULL"). Normalise them up front, but record that we did.
+    reasons = list(raw.issues)
+    warnings = []
     v = dict(raw.values)
     for k, val in v.items():
-        if isinstance(val, str) and val.strip().upper() in NULL_SENTINELS:
-            v[k] = None
+        if isinstance(val, str) and val.strip().upper() in NULL_WORDS:
             warnings.append(f"NULL_SENTINEL_STRING:{k}={val.strip()}")
+            v[k] = None
 
-    # --- mandatory -------------------------------------------------------
     for f in MANDATORY:
         if not v.get(f):
             reasons.append(f"MANDATORY_MISSING:{f}")
 
-    # --- lengths / format ---------------------------------------------------
-    for f, n in MAX_LENGTH.items():
+    for f, n in MAX_LEN.items():
         if v.get(f) and len(v[f]) > n:
             (reasons if f in ("member_name", "member_id") else warnings).append(f"LENGTH_EXCEEDED:{f}")
-    member_id = v.get("member_id")
-    if member_id and not _MEMBER_ID.match(member_id):
+
+    mid = v.get("member_id")
+    if mid and not _ID_RE.match(mid):
         reasons.append("INVALID_FORMAT:member_id")
-    elif member_id and member_id.isdigit() and len(member_id) < EXPECTED_MIN_MEMBER_ID_LEN:
+    elif mid and mid.isdigit() and len(mid) < 6:
         warnings.append("MEMBER_ID_SHORTER_THAN_EXPECTED")
 
-    # --- dates ------------------------------------------------------------
-    def _parse(name: str, fn):
+    def _parse(name, fn):
         try:
             return fn(v.get(name))
         except ValueError:
             reasons.append(f"INVALID_DATE:{name}={v.get(name)}")
             return None
 
-    enrollment = _parse("enrollment_date", dates.parse_yyyymmdd)
-    last_flight = _parse("last_flight_date", dates.parse_yyyymmdd)
-    dob = _parse("dob", dates.parse_mmddyyyy)
+    enrollment = _parse("enrollment_date", parse_yyyymmdd)
+    last_flight = _parse("last_flight_date", parse_yyyymmdd)
+    dob = _parse("dob", parse_mmddyyyy)
     if dob and v.get("dob") and len(v["dob"].strip()) == 7:
         warnings.append("DOB_LEADING_ZERO_RESTORED")
 
-    # --- country ----------------------------------------------------------
-    country_raw = _upper(v.get("country"))
-    country = countries.resolve(country_raw)
-    if country is None:
+    country_raw = v.get("country").strip().upper() if v.get("country") and v.get("country").strip() else None
+    mapped = _COUNTRY.get(country_raw) if country_raw else None
+    if mapped is None:
         reasons.append(f"UNKNOWN_COUNTRY:{country_raw or '<null>'}")
-    elif country.code != country_raw:
-        warnings.append(f"COUNTRY_CODE_NORMALISED:{country_raw}->{country.code}")
+    elif mapped[0] != country_raw:
+        warnings.append(f"COUNTRY_CODE_NORMALISED:{country_raw}->{mapped[0]}")
 
     if reasons:
-        return Reject(raw.src_file_name, raw.src_row_number, member_id, reasons, dict(raw.values))
+        return Reject(raw.src_file_name, raw.src_row_number, mid, reasons, dict(raw.values))
 
-    # --- soft checks ------------------------------------------------------
-    tier = _upper(v.get("tier_code"))
-    active = _upper(v.get("is_active"))
+    tier = v.get("tier_code").strip().upper() if v.get("tier_code") and v.get("tier_code").strip() else None
+    active = v.get("is_active").strip().upper() if v.get("is_active") and v.get("is_active").strip() else None
     if tier and tier not in VALID_TIERS:
         warnings.append(f"UNKNOWN_TIER:{tier}")
-    if active and active not in VALID_ACTIVE_FLAGS:
+    if active and active not in VALID_ACTIVE:
         warnings.append(f"UNKNOWN_ACTIVE_FLAG:{active}")
     if last_flight and last_flight < enrollment:
         warnings.append("FLIGHT_BEFORE_ENROLLMENT")
@@ -146,28 +162,30 @@ def stage_record(raw: RawRecord, src_file_ts: datetime, as_of: date) -> StagedMe
     if enrollment > as_of:
         warnings.append("ENROLLMENT_DATE_IN_FUTURE")
 
-    age = dates.age_on(dob, as_of)
+    age = age_on(dob, as_of)
     if age is not None and not 0 <= age <= 120:
         warnings.append(f"AGE_OUT_OF_RANGE:{age}")
-    days = dates.days_since_flight(last_flight, enrollment, as_of)
+    anchor = last_flight or enrollment
+    days = (as_of - anchor).days if anchor else None
+    stale = None if days is None else days > 90
 
     member = StagedMember(
-        member_id=member_id,
+        member_id=mid,
         member_name=v["member_name"].strip(),
         enrollment_date=enrollment,
         last_flight_date=last_flight,
         tier_code=tier,
         agent_name=(v.get("agent_name") or None),
-        state=_upper(v.get("state")),
+        state=v.get("state").strip().upper() if v.get("state") and v.get("state").strip() else None,
         country_code_raw=country_raw,
-        country_code=country.code,
-        target_table=country.target_table,
+        country_code=mapped[0],
+        target_table=mapped[1],
         post_code=v.get("post_code"),
         dob=dob,
         is_active=active,
         age=age,
         days_since_flight=days,
-        stale_member=dates.is_stale(days),
+        stale_member=stale,
         as_of_date=as_of,
         src_file_name=raw.src_file_name,
         src_file_ts=src_file_ts,
@@ -178,9 +196,7 @@ def stage_record(raw: RawRecord, src_file_ts: datetime, as_of: date) -> StagedMe
     return member
 
 
-def stage_records(
-    raws, src_file_ts: datetime, as_of: date
-) -> tuple[list[StagedMember], list[Reject]]:
+def stage_records(raws, src_file_ts: datetime, as_of: date):
     staged, rejects = [], []
     for raw in raws:
         out = stage_record(raw, src_file_ts, as_of)

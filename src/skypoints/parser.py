@@ -1,21 +1,11 @@
-"""Streaming parser for the pipe-delimited member flat file.
+"""Pipe-delimited member file + feed filename parsing."""
 
-Layout:  |H|Member_Name|Member_Id|...      header (exactly one)
-         |D|Elena|223457|...              detail
-         |T|<count>                       trailer (optional; recommended)
-
-Parsing is header-driven: values are mapped by header name, not position,
-so an added column (e.g. Post_Code, which the spec lists but the sample
-header omits) does not shift every field after it. The file is read line by
-line, so memory use is constant regardless of file size.
-"""
-from __future__ import annotations
-
+import re
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Iterator, TextIO
 
-# Header name -> canonical field name
 HEADER_TO_FIELD = {
     "Member_Name": "member_name",
     "Member_Id": "member_id",
@@ -34,15 +24,42 @@ EXPECTED_HEADER = [
     "Agent_Name", "State", "Country", "DOB", "Is_Active",
 ]
 
+_FILE_RE = re.compile(
+    r"^SKYPOINTS_(?P<kind>MBR|RDM)_(?P<date>\d{8})_(?P<time>\d{6})(?P<hund>\d{2})\.(?P<ext>dat|json)$"
+)
+_EXT = {"MBR": "dat", "RDM": "json"}
+
+
+@dataclass
+class FeedFile:
+    path: Path
+    kind: str
+    produced_at: datetime
+
+
+class FileNameError(ValueError):
+    pass
+
+
+def parse_file_name(path: str | Path) -> FeedFile:
+    path = Path(path)
+    m = _FILE_RE.match(path.name)
+    if not m:
+        raise FileNameError(f"bad name: {path.name}")
+    if _EXT[m["kind"]] != m["ext"]:
+        raise FileNameError(f"ext mismatch: {path.name}")
+    ts = datetime.strptime(m["date"] + m["time"], "%Y%m%d%H%M%S")
+    ts = ts.replace(microsecond=int(m["hund"]) * 10_000)
+    return FeedFile(path=path, kind=m["kind"], produced_at=ts)
+
 
 @dataclass
 class RawRecord:
-    """One detail line, all values still strings (mirrors RAW_MEMBER_PROFILE)."""
     values: dict[str, str | None]
     src_file_name: str
     src_row_number: int
     raw_line: str
-    issues: list[str] = field(default_factory=list)   # structural problems found while parsing
+    issues: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -60,7 +77,7 @@ class FlatFileError(ValueError):
 
 def _split(line: str) -> list[str]:
     parts = line.rstrip("\r\n").split("|")
-    if parts and parts[0] == "":          # leading delimiter
+    if parts and parts[0] == "":
         parts = parts[1:]
     return [p.strip() for p in parts]
 
@@ -79,7 +96,7 @@ def iter_member_file(
 
         if rtype == "H":
             if columns is not None:
-                raise FlatFileError(f"{src_file_name}:{line_no}: second header record")
+                raise FlatFileError(f"{src_file_name}:{line_no}: second header")
             columns = payload
             summary.header = payload
             unknown = [c for c in payload if c not in HEADER_TO_FIELD]
@@ -102,7 +119,7 @@ def iter_member_file(
             continue
 
         if columns is None:
-            raise FlatFileError(f"{src_file_name}:{line_no}: detail record before header")
+            raise FlatFileError(f"{src_file_name}:{line_no}: detail before header")
 
         summary.detail_rows += 1
         issues = []
@@ -122,5 +139,5 @@ def read_member_file(path: str | Path) -> tuple[list[RawRecord], FileSummary]:
     with path.open(encoding="utf-8") as fh:
         records = list(iter_member_file(fh, path.name, summary))
     if summary.header is None:
-        raise FlatFileError(f"{path.name}: no header record")
+        raise FlatFileError(f"{path.name}: no header")
     return records, summary

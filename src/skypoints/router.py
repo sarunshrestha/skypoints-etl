@@ -1,11 +1,4 @@
-"""STAGING -> TABLE_<COUNTRY> with "latest record wins".
-
-Mirrors CORE.SP_SPLIT_MEMBERS_BY_COUNTRY. ``CountryTables`` holds the
-target tables plus the member->country cross-reference; ``apply`` is
-idempotent and order-independent: feeding the same files again, or an
-older file after a newer one, never regresses a member.
-"""
-from __future__ import annotations
+"""Apply staged members into per-country tables (latest file/line wins)."""
 
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -39,18 +32,6 @@ class ApplyResult:
     superseded_in_batch: int = 0
 
 
-def latest_per_member(batch: Iterable[StagedMember]) -> tuple[dict[str, StagedMember], int]:
-    """Collapse a batch to one record per member (= SQL QUALIFY ROW_NUMBER() = 1)."""
-    latest: dict[str, StagedMember] = {}
-    total = 0
-    for rec in batch:
-        total += 1
-        cur = latest.get(rec.member_id)
-        if cur is None or rec.order_key > cur.order_key:
-            latest[rec.member_id] = rec
-    return latest, total - len(latest)
-
-
 @dataclass
 class CountryTables:
     tables: dict[str, dict[str, StagedMember]] = field(default_factory=dict)
@@ -59,12 +40,17 @@ class CountryTables:
 
     def apply(self, batch: Iterable[StagedMember]) -> ApplyResult:
         result = ApplyResult()
-        latest, result.superseded_in_batch = latest_per_member(batch)
+        latest = {}
+        total = 0
+        for rec in batch:
+            total += 1
+            cur = latest.get(rec.member_id)
+            if cur is None or rec.order_key > cur.order_key:
+                latest[rec.member_id] = rec
+        result.superseded_in_batch = total - len(latest)
 
         for member_id, rec in latest.items():
             prev = self.xref.get(member_id)
-
-            # Late or replayed data must never overwrite newer data.
             if prev is not None and rec.order_key <= prev.order_key:
                 result.ignored_older += 1
                 continue
@@ -88,5 +74,4 @@ class CountryTables:
         return result
 
     def where_is(self, member_id: str) -> list[str]:
-        """All tables containing the member (should always be 0 or 1)."""
         return [t for t, rows in self.tables.items() if member_id in rows]
