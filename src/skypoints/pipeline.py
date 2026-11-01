@@ -48,7 +48,7 @@ def _reason_key(reason: str) -> str:
     return reason.split(":", 1)[0]
 
 
-def run(input_dir: Path | None, legacy_dir: Path | None, out_dir: Path, as_of: date,
+def run(input_dir: Path | list[Path] | None, legacy_dir: Path | None, out_dir: Path, as_of: date,
         legacy_ts: datetime | None = None) -> RunReport:
     report = RunReport(as_of=as_of.isoformat())
     tables = CountryTables()
@@ -75,8 +75,9 @@ def run(input_dir: Path | None, legacy_dir: Path | None, out_dir: Path, as_of: d
     # ---- unified feeds, oldest first (order does not change the outcome,
     #      the router is order-independent, but it keeps logs readable) ----
     feeds = []
-    if input_dir:
-        for p in sorted(input_dir.iterdir()):
+    input_dirs = [input_dir] if isinstance(input_dir, Path) else list(input_dir or [])
+    for d in input_dirs:
+        for p in sorted(d.iterdir()):
             if p.is_file():
                 try:
                     feeds.append(parse_file_name(p))
@@ -180,7 +181,8 @@ def _write_outputs(out_dir, tables, rejects, facts, members, redemption_rejects,
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--input", type=Path, help="folder with SKYPOINTS_MBR_*/SKYPOINTS_RDM_* files")
+    ap.add_argument("--input", type=Path, nargs="*", default=[],
+                    help="folder(s) with SKYPOINTS_MBR_*/SKYPOINTS_RDM_* files")
     ap.add_argument("--legacy", type=Path, help="folder with INDin.csv / USAin.csv / AUS.xlsx")
     ap.add_argument("--out", type=Path, default=Path("out"))
     ap.add_argument("--as-of", type=date.fromisoformat, default=date.today(),
